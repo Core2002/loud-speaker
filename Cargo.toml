@@ -5,3 +5,11 @@ edition = "2021"
 
 [dependencies]
 cpal = "0.15.3"
+actix = "0.13.5"
+actix-web = "4"
+actix-web-actors = "4.3.0"
+awc = "3.5.0"
+tokio = {version ="1.38.0",features = ["full"]}
+futures-util = { version = "0.3.30", default-features = false, features = ["std","sink"] }
+log = "0.4.21"
+clap = "4.5.7"
