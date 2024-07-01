@@ -30,15 +30,21 @@ async fn handle_connection(tcp_stream: TcpStream, peer_map: PerrMap, addr: Socke
     let (tx, rx) = mpsc::unbounded();
     peer_map.lock().unwrap().insert(addr, tx);
 
-    let (outgoing,incoming) = ws_stream.split();
+    let (outgoing, incoming) = ws_stream.split();
 
     let broadcast_incoming = incoming.try_for_each(|msg| {
-        println!("Received a message from {}: {}", addr, msg.to_text().unwrap());
+        println!(
+            "Received a message from {}: {}",
+            addr,
+            msg.to_text().unwrap()
+        );
         let peers = peer_map.lock().unwrap();
 
         // We want to broadcast the message to everyone except ourselves.
-        let broadcast_recipients =
-            peers.iter().filter(|(peer_addr, _)| peer_addr != &&addr).map(|(_, ws_sink)| ws_sink);
+        let broadcast_recipients = peers
+            .iter()
+            .filter(|(peer_addr, _)| peer_addr != &&addr)
+            .map(|(_, ws_sink)| ws_sink);
 
         for recp in broadcast_recipients {
             recp.unbounded_send(msg.clone()).unwrap();
@@ -54,5 +60,4 @@ async fn handle_connection(tcp_stream: TcpStream, peer_map: PerrMap, addr: Socke
 
     println!("{} disconnected", &addr);
     peer_map.lock().unwrap().remove(&addr);
-    
 }

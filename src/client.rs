@@ -1,6 +1,6 @@
-use std::sync::{Arc, Mutex};
 use futures::channel::mpsc;
 use futures::{future, pin_mut, StreamExt};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;

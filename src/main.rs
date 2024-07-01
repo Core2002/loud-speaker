@@ -19,6 +19,7 @@ async fn main() {
         .get_matches();
 
     let host = cpal::default_host();
+    let default_output_device = host.default_output_device().expect("没有找到默认输出设备");
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let bfc = buffer.clone();
     let bfs = buffer.clone();
@@ -29,29 +30,17 @@ async fn main() {
     {
         0 => {
             println!("Debug mode is off");
-            mic(
-                host.default_input_device().expect("没有找到默认输入设备"),
-                buffer.clone(),
-            );
-            loud(
-                host.default_output_device().expect("没有找到默认输出设备"),
-                buffer.clone(),
-            );
+            mic(default_output_device.clone(), buffer.clone());
+            loud(default_output_device, buffer.clone());
         }
         1 => {
             println!("server mode is on");
-            mic(
-                host.default_input_device().expect("没有找到默认输入设备"),
-                buffer.clone(),
-            );
+            mic(default_output_device, buffer.clone());
             server_init(bfs).await;
         }
         2 => {
             println!("client mode is on");
-            loud(
-                host.default_output_device().expect("没有找到默认输出设备"),
-                buffer.clone(),
-            );
+            loud(default_output_device, buffer.clone());
             client_init(bfc).await;
         }
         _ => println!("Don't be crazy"),
