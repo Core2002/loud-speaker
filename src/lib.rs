@@ -8,15 +8,12 @@ use cpal::{
     Device,
 };
 
-pub fn loud(input_device: Device, output_device: Device, buffer: Arc<Mutex<Vec<f32>>>) {
+
+pub fn mic(input_device: Device, buffer: Arc<Mutex<Vec<f32>>>) {
     thread::spawn(move || {
         let input_config = input_device
             .default_input_config()
             .expect("输入设备配置错误");
-        let output_config = output_device
-            .default_output_config()
-            .expect("输出设备配置错误");
-
         let input_buffer = buffer.clone();
         let input_stream = input_device
             .build_input_stream(
@@ -31,6 +28,20 @@ pub fn loud(input_device: Device, output_device: Device, buffer: Arc<Mutex<Vec<f
                 None,
             )
             .expect("构建输入流时出错");
+
+        input_stream.play().expect("输入流运行错误");
+        loop {
+            thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
+}
+
+
+pub fn loud(output_device: Device, buffer: Arc<Mutex<Vec<f32>>>) {
+    thread::spawn(move || {
+        let output_config = output_device
+            .default_output_config()
+            .expect("输出设备配置错误");
 
         let output_stream = output_device
             .build_output_stream(
@@ -47,11 +58,7 @@ pub fn loud(input_device: Device, output_device: Device, buffer: Arc<Mutex<Vec<f
                 None,
             )
             .expect("构建输出流时出错");
-
-        input_stream.play().expect("输入流运行错误");
         output_stream.play().expect("输出流运行错误");
-
-        println!("正在聆听...");
         loop {
             thread::sleep(std::time::Duration::from_secs(60));
         }
