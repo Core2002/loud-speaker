@@ -1,39 +1,58 @@
-use actix_web::App;
-use actix::{Actor, StreamHandler};
-use actix_web::{web, Error, HttpRequest, HttpResponse, HttpServer};
-use actix_web_actors::ws;
-use tokio::task;
+use futures::channel::mpsc::{self, UnboundedSender};
+use futures::{future, pin_mut, StreamExt, TryStreamExt};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::Message;
 
-pub fn server_init() {
-    task::spawn(async {
-        HttpServer::new(|| App::new().route("/ws/", web::get().to(index)))
-            .bind(("0.0.0.0", 8080))
-            .expect("绑定地址失败")
-            .run()
-            .await
-            .expect("启动服务器失败");
-    });
-}
+type PerrMap = Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>;
 
-struct MyWs;
+const SERVER_ADDR: &str = "127.0.0.1:8080";
 
-impl Actor for MyWs {
-    type Context = ws::WebsocketContext<Self>;
-}
+pub async fn server_init(buffer: Arc<Mutex<Vec<f32>>>) {
+    let listener = TcpListener::bind(SERVER_ADDR).await.unwrap();
 
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for MyWs {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        match msg {
-            Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
-            Ok(ws::Message::Text(text)) => ctx.text(text),
-            Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
-            _ => (),
-        }
+    let peers: PerrMap = Arc::new(Mutex::new(HashMap::new()));
+    while let Ok((stream, peer_addr)) = listener.accept().await {
+        let peers = Arc::clone(&peers);
+        tokio::spawn(handle_connection(stream, peers, peer_addr));
     }
 }
 
-async fn index(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
-    let resp = ws::start(MyWs {}, &req, stream);
-    println!("{:?}", resp);
-    resp
+async fn handle_connection(tcp_stream: TcpStream, peer_map: PerrMap, addr: SocketAddr) {
+    let ws_stream = tokio_tungstenite::accept_async(tcp_stream)
+        .await
+        .expect("Error during websocket handshake");
+
+    println!("New connection from: {}", addr);
+
+    let (tx, rx) = mpsc::unbounded();
+    peer_map.lock().unwrap().insert(addr, tx);
+
+    let (outgoing,incoming) = ws_stream.split();
+
+    let broadcast_incoming = incoming.try_for_each(|msg| {
+        println!("Received a message from {}: {}", addr, msg.to_text().unwrap());
+        let peers = peer_map.lock().unwrap();
+
+        // We want to broadcast the message to everyone except ourselves.
+        let broadcast_recipients =
+            peers.iter().filter(|(peer_addr, _)| peer_addr != &&addr).map(|(_, ws_sink)| ws_sink);
+
+        for recp in broadcast_recipients {
+            recp.unbounded_send(msg.clone()).unwrap();
+        }
+
+        future::ok(())
+    });
+
+    let receive_from_others = rx.map(Ok).forward(outgoing);
+
+    pin_mut!(broadcast_incoming, receive_from_others);
+    future::select(broadcast_incoming, receive_from_others).await;
+
+    println!("{} disconnected", &addr);
+    peer_map.lock().unwrap().remove(&addr);
+    
 }
