@@ -24,7 +24,6 @@ async fn main() {
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let bfc = buffer.clone();
-    let bfs = buffer.clone();
 
     match matches
         .get_one::<u8>("debug")
@@ -38,7 +37,7 @@ async fn main() {
         1 => {
             println!("server mode is on");
             mic(default_input_device, buffer.clone());
-            server_init(bfs).await;
+            server_init().await;
         }
         2 => {
             println!("client mode is on");

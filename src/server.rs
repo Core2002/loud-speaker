@@ -10,7 +10,7 @@ type PerrMap = Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>;
 
 const SERVER_ADDR: &str = "127.0.0.1:8080";
 
-pub async fn server_init(buffer: Arc<Mutex<Vec<f32>>>) {
+pub async fn server_init() {
     let listener = TcpListener::bind(SERVER_ADDR).await.unwrap();
 
     let peers: PerrMap = Arc::new(Mutex::new(HashMap::new()));
@@ -33,11 +33,11 @@ async fn handle_connection(tcp_stream: TcpStream, peer_map: PerrMap, addr: Socke
     let (outgoing, incoming) = ws_stream.split();
 
     let broadcast_incoming = incoming.try_for_each(|msg| {
-        println!(
-            "Received a message from {}: {}",
-            addr,
-            msg.to_text().unwrap()
-        );
+        // println!(
+        //     "Received a message from {}: {}",
+        //     addr,
+        //     msg.to_text().unwrap()
+        // );
         let peers = peer_map.lock().unwrap();
 
         // We want to broadcast the message to everyone except ourselves.
