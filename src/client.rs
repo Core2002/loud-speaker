@@ -1,11 +1,10 @@
 use futures::channel::mpsc;
 use futures::{future, pin_mut, StreamExt};
-use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-pub async fn client_init(buffer: Arc<Mutex<Vec<f32>>>) {
+pub async fn client_init() {
     let url = "ws://127.0.0.1:8080";
     let (stdin_tx, stdin_rx) = mpsc::unbounded();
     tokio::spawn(read_stdin(stdin_tx));

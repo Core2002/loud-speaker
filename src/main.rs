@@ -2,8 +2,8 @@ mod client;
 mod server;
 use clap::{arg, command};
 use client::client_init;
-use cpal::traits::HostTrait;
-use loud_speaker::{loud, mic};
+use cpal::traits::{DeviceTrait, HostTrait};
+use loud_speaker::{loud, mic, AudioBus};
 use server::server_init;
 use std::{
     sync::{Arc, Mutex},
@@ -22,8 +22,14 @@ async fn main() {
     let default_input_device = host.default_input_device().expect("没有找到默认输入设备");
     let default_output_device = host.default_output_device().expect("没有找到默认输出设备");
 
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let bfc = buffer.clone();
+    let input_config = default_input_device
+        .default_input_config()
+        .expect("输入设备配置错误");
+    let output_config = default_output_device
+        .default_output_config()
+        .expect("输出设备配置错误");
+
+    let bus = Arc::new(Mutex::new(AudioBus::new(&input_config, &output_config)));
 
     match matches
         .get_one::<u8>("debug")
@@ -31,18 +37,18 @@ async fn main() {
     {
         0 => {
             println!("Debug mode is off");
-            mic(default_input_device, buffer.clone());
-            loud(default_output_device, buffer.clone());
+            mic(bus.clone(), default_input_device, input_config);
+            loud(bus.clone(), default_output_device, output_config);
         }
         1 => {
             println!("server mode is on");
-            mic(default_input_device, buffer.clone());
+            mic(bus.clone(), default_input_device, input_config);
             server_init().await;
         }
         2 => {
             println!("client mode is on");
-            loud(default_output_device, buffer.clone());
-            client_init(bfc).await;
+            loud(bus.clone(), default_output_device, output_config);
+            client_init().await;
         }
         _ => println!("Don't be crazy"),
     }
@@ -50,5 +56,4 @@ async fn main() {
     loop {
         thread::sleep(std::time::Duration::from_secs(60));
     }
-    // Ok(())
 }
