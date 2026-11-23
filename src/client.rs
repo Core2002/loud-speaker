@@ -1,40 +1,85 @@
-use futures::channel::mpsc;
-use futures::{future, pin_mut, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::StreamExt;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-pub async fn client_init() {
-    let url = "ws://127.0.0.1:8080";
-    let (stdin_tx, stdin_rx) = mpsc::unbounded();
-    tokio::spawn(read_stdin(stdin_tx));
+use loud_speaker::{proto, AudioBus};
 
-    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
-    println!("WebSocket handshake has been successfully completed");
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// The server streams continuously (silence included), so a long gap means the
+/// connection is dead even if the OS has not noticed yet.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-    let (write, read) = ws_stream.split();
-
-    let stdin_to_ws = stdin_rx.map(Ok).forward(write);
-    let ws_to_stdout = {
-        read.for_each(|message| async {
-            let data = message.unwrap().into_data();
-            tokio::io::stdout().write_all(&data).await.unwrap();
-        })
-    };
-
-    pin_mut!(stdin_to_ws, ws_to_stdout);
-    future::select(stdin_to_ws, ws_to_stdout).await;
+/// Connect to a server, feed received audio into `bus`, and reconnect forever.
+///
+/// `out_rate` / `out_channels` describe the local speaker; the bus is rebuilt
+/// from the server's sample rate whenever a new session announces itself.
+pub async fn client_init(bus: Arc<Mutex<AudioBus>>, url: &str, out_rate: u32, out_channels: usize) {
+    loop {
+        match connect_async(url).await {
+            Ok((ws_stream, _)) => {
+                println!("已连接服务端: {url}");
+                receive_audio(ws_stream, &bus, out_rate, out_channels).await;
+                println!("与服务端断开，{} 秒后重连...", RECONNECT_DELAY.as_secs());
+            }
+            Err(err) => {
+                eprintln!(
+                    "连接 {url} 失败: {err}，{} 秒后重试...",
+                    RECONNECT_DELAY.as_secs()
+                );
+            }
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
 }
 
-async fn read_stdin(tx: mpsc::UnboundedSender<Message>) {
-    let mut stdin = tokio::io::stdin();
+async fn receive_audio(
+    mut ws_stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    bus: &Arc<Mutex<AudioBus>>,
+    out_rate: u32,
+    out_channels: usize,
+) {
     loop {
-        let mut buf = vec![0; 1024];
-        let n = match stdin.read(&mut buf).await {
-            Err(_) | Ok(0) => break,
-            Ok(n) => n,
+        let message = match tokio::time::timeout(READ_TIMEOUT, ws_stream.next()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(_) => {
+                eprintln!("{} 秒未收到音频，断开重连...", READ_TIMEOUT.as_secs());
+                break;
+            }
         };
-        buf.truncate(n);
-        tx.unbounded_send(Message::binary(buf)).unwrap();
+
+        match message {
+            Ok(Message::Text(text)) => match proto::parse_hello(&text) {
+                Some((sample_rate, channels)) => {
+                    println!("服务端音频格式: {sample_rate} Hz / {channels} 声道");
+                    if let Ok(mut bus) = bus.lock() {
+                        // Start a fresh session; this also discards audio that
+                        // was queued before a reconnect.
+                        *bus = AudioBus::from_rates(sample_rate, out_rate, out_channels);
+                    }
+                }
+                None => eprintln!("忽略未知控制消息: {text}"),
+            },
+            Ok(Message::Binary(bytes)) => {
+                let samples = proto::decode_samples(&bytes);
+                if samples.is_empty() {
+                    continue;
+                }
+                if let Ok(mut bus) = bus.lock() {
+                    bus.push_mono(&samples);
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("接收音频失败: {err}");
+                break;
+            }
+        }
     }
 }

@@ -8,6 +8,54 @@ use cpal::{
     Device, StreamConfig, SupportedStreamConfig,
 };
 
+/// Wire format shared by the server (mode 1) and the client (mode 2).
+///
+/// A session starts with a text hello (`LSPK1 <sample_rate> <channels>`) sent
+/// by the server, followed by binary frames of raw mono `f32` samples in
+/// little-endian order at that sample rate. Keeping the hello as text means a
+/// binary frame can never be mistaken for metadata.
+pub mod proto {
+    const HELLO_PREFIX: &str = "LSPK1";
+
+    /// Build the text hello announcing the stream format.
+    pub fn hello(sample_rate: u32, channels: u16) -> String {
+        format!("{} {} {}", HELLO_PREFIX, sample_rate, channels)
+    }
+
+    /// Parse a hello created by [`hello`]. Returns `(sample_rate, channels)`.
+    pub fn parse_hello(text: &str) -> Option<(u32, u16)> {
+        let mut parts = text.split_whitespace();
+        if parts.next()? != HELLO_PREFIX {
+            return None;
+        }
+        let sample_rate = parts.next()?.parse().ok()?;
+        let channels = parts.next()?.parse().ok()?;
+        if parts.next().is_some() || sample_rate == 0 || channels == 0 {
+            return None;
+        }
+        Some((sample_rate, channels))
+    }
+
+    /// Encode mono samples as little-endian `f32` bytes for a binary frame.
+    pub fn encode_samples(samples: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(samples.len() * 4);
+        for &sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Decode a binary frame. A trailing partial sample is ignored.
+    pub fn decode_samples(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect()
+    }
+}
+
 /// Shared audio pipeline between the mic (producer) and the speaker (consumer).
 ///
 /// The microphone and the speaker are independent hardware with their own
@@ -37,14 +85,16 @@ pub struct AudioBus {
 
 impl AudioBus {
     pub fn new(input: &SupportedStreamConfig, output: &SupportedStreamConfig) -> AudioBus {
-        AudioBus::init(
+        AudioBus::from_rates(
             input.sample_rate().0,
             output.sample_rate().0,
             output.channels() as usize,
         )
     }
 
-    fn init(in_rate: u32, out_rate: u32, out_channels: usize) -> AudioBus {
+    /// Build a bus for explicit rates. Useful when the producer is not a local
+    /// microphone (client mode receives audio at the server's rate).
+    pub fn from_rates(in_rate: u32, out_rate: u32, out_channels: usize) -> AudioBus {
         let lag = (in_rate as f64 * 0.05).round().max(128.0);
         AudioBus {
             out_channels,
@@ -57,20 +107,51 @@ impl AudioBus {
         }
     }
 
+    /// Append one mono sample, dropping the oldest audio once the ring is at
+    /// capacity so latency (and memory) cannot grow without bound.
+    fn push_sample(&mut self, mono: f32) {
+        if self.ring.len() as f64 >= self.max_lag {
+            self.ring.pop_front();
+            self.consumed += 1;
+        }
+        self.ring.push_back(mono);
+    }
+
+    /// Append already down-mixed mono samples (e.g. received over the network).
+    pub fn push_mono(&mut self, samples: &[f32]) {
+        for &sample in samples {
+            self.push_sample(sample);
+        }
+    }
+
+    /// Remove and return up to `max` buffered mono samples, oldest first.
+    ///
+    /// This is the producer-side counterpart of [`AudioBus::fill_output`],
+    /// used by the server to forward freshly captured audio over the network.
+    /// Do not mix it with `fill_output` on the same bus.
+    pub fn drain(&mut self, max: usize) -> Vec<f32> {
+        let count = self.ring.len().min(max);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(sample) = self.ring.pop_front() {
+                out.push(sample);
+            }
+        }
+        self.consumed += count as u64;
+        if (self.pos as u64) < self.consumed {
+            self.pos = self.consumed as f64;
+        }
+        out
+    }
+
     /// Down-mix one capture chunk to mono and append it to the ring.
     fn push_frames(&mut self, data: &[f32], channels: usize) {
         if channels == 0 {
             return;
         }
         for frame in data.chunks_exact(channels) {
-            // If the consumer is far behind, drop the oldest audio instead of
-            // letting the delay (or the buffer) grow without end.
-            if self.ring.len() as f64 >= self.max_lag {
-                self.ring.pop_front();
-                self.consumed += 1;
-            }
             let mono = frame.iter().sum::<f32>() / channels as f32;
-            self.ring.push_back(mono);
+            self.push_sample(mono);
         }
     }
 
@@ -165,7 +246,11 @@ pub fn mic(bus: Arc<Mutex<AudioBus>>, input_device: Device, input_config: Suppor
     });
 }
 
-pub fn loud(bus: Arc<Mutex<AudioBus>>, output_device: Device, output_config: SupportedStreamConfig) {
+pub fn loud(
+    bus: Arc<Mutex<AudioBus>>,
+    output_device: Device,
+    output_config: SupportedStreamConfig,
+) {
     thread::spawn(move || {
         let config: StreamConfig = output_config.into();
         let output_stream = output_device
@@ -192,7 +277,7 @@ pub fn loud(bus: Arc<Mutex<AudioBus>>, output_device: Device, output_config: Sup
 
 #[cfg(test)]
 mod tests {
-    use super::AudioBus;
+    use super::{proto, AudioBus};
 
     /// Simulates a constant-signal mic (mono `level`) feeding the bus, then the
     /// speaker pulling `out_frames` stereo frames. Returns whether every channel
@@ -206,7 +291,7 @@ mod tests {
         level: f32,
         out_frames: usize,
     ) -> (bool, usize) {
-        let mut bus = AudioBus::init(in_rate, out_rate, out_ch);
+        let mut bus = AudioBus::from_rates(in_rate, out_rate, out_ch);
 
         let in_samples = (in_rate as f64 * seconds).round() as usize;
         let chunk = vec![level; 4096];
@@ -229,7 +314,11 @@ mod tests {
         // Mono mic 48k -> stereo speakers 48k (the most common breakage).
         let (ok, ring) = run_bridge(48_000, 48_000, 1, 2, 1.0, 0.5, 4800);
         assert!(ok, "output was not reproduced across the channel gap");
-        assert!(ring as f64 <= 48_000.0 * 0.25 + 2.0, "ring grew unbounded: {}", ring);
+        assert!(
+            ring as f64 <= 48_000.0 * 0.25 + 2.0,
+            "ring grew unbounded: {}",
+            ring
+        );
     }
 
     #[test]
@@ -241,7 +330,7 @@ mod tests {
 
     #[test]
     fn ring_is_bounded_under_producer_overload() {
-        let mut bus = AudioBus::init(48_000, 48_000, 2);
+        let mut bus = AudioBus::from_rates(48_000, 48_000, 2);
         let chunk = vec![0.5f32; 4096];
         // Push ~10x more than the cap without consuming.
         for _ in 0..120 {
@@ -258,7 +347,7 @@ mod tests {
     #[test]
     fn initial_silence_then_audio_after_cushion() {
         // Until the producer has buffered ~lag samples, output must be silence.
-        let mut bus = AudioBus::init(48_000, 48_000, 2);
+        let mut bus = AudioBus::from_rates(48_000, 48_000, 2);
         // Deliver only a tiny amount of input, then ask for a big output block.
         bus.push_frames(&vec![0.5f32; 100], 1);
         let mut data = vec![0.0f32; 4800 * 2];
@@ -266,6 +355,85 @@ mod tests {
         assert!(
             data.iter().all(|&s| s == 0.0),
             "expected silence before the cushion is full"
+        );
+    }
+
+    #[test]
+    fn drain_returns_buffered_samples_in_order() {
+        let mut bus = AudioBus::from_rates(48_000, 48_000, 2);
+        bus.push_mono(&[0.1, 0.2, 0.3]);
+
+        assert_eq!(bus.drain(2), vec![0.1, 0.2]);
+        assert_eq!(bus.drain(usize::MAX), vec![0.3]);
+        assert!(bus.drain(1).is_empty());
+    }
+
+    #[test]
+    fn network_push_is_bounded_and_keeps_latest_audio() {
+        let mut bus = AudioBus::from_rates(48_000, 48_000, 2);
+        // One huge frame (1 s) must be trimmed down to the latency cap.
+        let samples: Vec<f32> = (0..48_000).map(|i| i as f32).collect();
+        bus.push_mono(&samples);
+
+        assert!(
+            bus.ring.len() as f64 <= bus.max_lag + 2.0,
+            "ring length {} exceeded cap {}",
+            bus.ring.len(),
+            bus.max_lag
+        );
+        assert_eq!(bus.ring.back(), Some(&47_999.0));
+    }
+
+    #[test]
+    fn hello_roundtrip_and_rejects_malformed_text() {
+        assert_eq!(
+            proto::parse_hello(&proto::hello(48_000, 1)),
+            Some((48_000, 1))
+        );
+        assert_eq!(proto::parse_hello("LSPK1 44100 2"), Some((44_100, 2)));
+
+        assert_eq!(proto::parse_hello("LSPK2 48000 1"), None);
+        assert_eq!(proto::parse_hello("LSPK1 0 1"), None);
+        assert_eq!(proto::parse_hello("LSPK1 48000 0"), None);
+        assert_eq!(proto::parse_hello("LSPK1 48000"), None);
+        assert_eq!(proto::parse_hello("LSPK1 48000 1 extra"), None);
+        assert_eq!(proto::parse_hello("hello"), None);
+    }
+
+    #[test]
+    fn samples_roundtrip_through_wire_encoding() {
+        let samples = [0.0, 0.5, -0.5, 1.0, -1.0];
+        let encoded = proto::encode_samples(&samples);
+
+        assert_eq!(encoded.len(), samples.len() * 4);
+        assert_eq!(proto::decode_samples(&encoded), samples);
+        // A truncated final sample is ignored instead of producing garbage.
+        assert!(proto::decode_samples(&[1, 2, 3]).is_empty());
+    }
+
+    #[test]
+    fn network_pipeline_reproduces_audio_at_another_rate() {
+        // Simulates mode 1 -> mode 2: 20 ms capture batches are drained,
+        // serialized, and pushed into a playback bus with a different rate.
+        let in_rate = 44_100;
+        let out_rate = 48_000;
+        let level = 0.3f32;
+        let mut capture = AudioBus::from_rates(in_rate, in_rate, 1);
+        let mut playback = AudioBus::from_rates(in_rate, out_rate, 2);
+
+        let frames_per_pump = (in_rate as f64 * 0.02).round() as usize;
+        let chunk = vec![level; frames_per_pump];
+        for _ in 0..50 {
+            capture.push_frames(&chunk, 1);
+            let wire = proto::decode_samples(&proto::encode_samples(&capture.drain(usize::MAX)));
+            playback.push_mono(&wire);
+        }
+
+        let mut out = vec![0.0f32; 4800 * 2];
+        playback.fill_output(&mut out);
+        assert!(
+            out.iter().all(|&s| (s - level).abs() < 1e-3),
+            "networked pipeline did not reproduce the mic signal"
         );
     }
 }
